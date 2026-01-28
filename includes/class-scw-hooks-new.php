@@ -122,6 +122,21 @@ class Hooks {
             return;
         }
 
+        // Debounce: if address+cart unchanged AND compliance already OK, do nothing (no validate/save/quote/compliance).
+        if (WC()->session) {
+            $sig = self::checkout_signature($ship_validate);
+
+            $lastSig  = (string) WC()->session->get('scw_last_sig');
+            $okForSig = (string) WC()->session->get('scw_sig_ok_' . $sig); // 'yes' or ''
+
+            if ($sig === $lastSig && $okForSig === 'yes') {
+                return;
+            }
+
+            WC()->session->set('scw_last_sig', $sig);
+        }
+
+
         $client = new Client();
         if (!$client->can_auth()) return;
 
@@ -235,6 +250,10 @@ class Hooks {
 
         $salesOrderKey = self::build_sales_order_key($shipTo);
 
+        if (WC()->session) {
+            WC()->session->set('scw_last_quote_salesOrderKey', $salesOrderKey);
+        }
+
         // Freeze dates per checkout so refresh hashing works
         [$purchaseDate, $shipDate] = self::get_frozen_dates();
 
@@ -328,6 +347,25 @@ class Hooks {
             return;
         }
 
+        // Run compliance check ONCE per signature (after quote)
+        if (WC()->session) {
+            $sig = (string) WC()->session->get('scw_last_sig');
+            $okForSig = (string) WC()->session->get('scw_sig_ok_' . $sig);
+
+            if ($sig !== '' && $okForSig !== 'yes') {
+                $resCompliance = self::check_compliance($client, $s, $salesOrder, $addressOption);
+
+                if (!$resCompliance['ok']) {
+                    wc_add_notice('Compliance check failed: ' . ($resCompliance['error'] ?? 'Unknown'), 'error');
+                    return;
+                }
+
+                WC()->session->set('scw_sig_ok_' . $sig, 'yes');
+                WC()->session->set('scw_last_compliance', $resCompliance['data']);
+            }
+        }
+
+
         
 
         // Save quote response + key for later commit
@@ -404,59 +442,6 @@ class Hooks {
         return $actions;
     }
 
-    // public static function order_action_push_tracking($order): void {
-    //     if (!$order instanceof \WC_Order) return;
-
-    //     $client = new Client();
-    //     if (!$client->can_auth()) {
-    //         $order->add_order_note('ShipCompliant tracking push skipped: missing credentials.');
-    //         return;
-    //     }
-
-    //     $s = Utils::get_settings();
-
-    //     // SalesOrderKey is the identifier used by this endpoint
-    //     $salesOrderKey = (string) $order->get_meta('_scw_sales_order_key');
-    //     if ($salesOrderKey === '') {
-    //         $order->add_order_note('ShipCompliant tracking push failed: missing SalesOrderKey (_scw_sales_order_key).');
-    //         return;
-    //     }
-
-    //     // Get tracking number(s)
-    //     $trackingNumber = trim((string) $order->get_meta('_tracking_number'));
-    //     if ($trackingNumber === '') {
-    //         $order->add_order_note('ShipCompliant tracking push skipped: tracking number not found on order meta (_tracking_number).');
-    //         return;
-    //     }
-
-    //     // If you ever want multiple tracking numbers, you can split by comma here.
-    //     $trackingNumbers = [$trackingNumber];
-
-    //     // ShipmentKey: Swagger sample shows "Ship1" but your integration uses ShipmentKey "1"
-    //     // Use "1" to match your SalesOrder payload.
-    //     $shipmentKey = '1';
-
-    //     // Build endpoint: /api/v1/salesOrders/{salesOrderKey}/tracking
-    //     $endpointTemplate = $s['endpoint_tracking'] ?? '/api/v1/salesOrders/{salesOrderKey}/tracking';
-    //     $endpoint = str_replace('{salesOrderKey}', rawurlencode($salesOrderKey), $endpointTemplate);
-
-    //     $payload = [
-    //         'ShipmentKey'      => $shipmentKey,
-    //         'TrackingNumbers'  => array_values(array_filter($trackingNumbers)),
-    //     ];
-
-    //     $res = $client->request('POST', $endpoint, $payload);
-
-    //     if (!$res['ok']) {
-    //         $order->add_order_note('ShipCompliant tracking push FAILED: ' . ($res['error'] ?? 'Unknown'));
-    //         return;
-    //     }
-
-    //     $order->add_order_note('ShipCompliant tracking push OK: ' . implode(', ', $trackingNumbers));
-    //     $order->update_meta_data('_scw_tracking_pushed', 'yes');
-    //     $order->save();
-    // }
-
     public static function order_action_push_tracking($order): void {
         if (!$order instanceof \WC_Order) return;
 
@@ -468,107 +453,87 @@ class Hooks {
 
         $s = Utils::get_settings();
 
-        // SalesOrderKey is the identifier used by this endpoint
+        // Preferred: SC order id if your commit returns one (often it doesn't)
+        $scOrderId = (string) $order->get_meta('_scw_order_id');
+
+        // Fallback: SalesOrderKey is ALWAYS known and is the safest identifier in your integration
         $salesOrderKey = (string) $order->get_meta('_scw_sales_order_key');
-        if ($salesOrderKey === '') {
-            $order->add_order_note('ShipCompliant tracking push failed: missing SalesOrderKey (_scw_sales_order_key).');
+
+        if ($scOrderId === '' && $salesOrderKey === '') {
+            $order->add_order_note('ShipCompliant tracking push failed: missing SC order ID and SalesOrderKey. Commit first.');
             return;
         }
 
-        /**
-         * Tracking numbers:
-         * Your site uses WooCommerce Shipment Tracking plugin meta: _wc_shipment_tracking_items
-         */
-        $trackingNumbers = [];
-        $trackingItems = $order->get_meta('_wc_shipment_tracking_items', true);
+        $trackingNumber = (string) $order->get_meta('_tracking_number');
+        $carrier        = (string) $order->get_meta('_tracking_carrier');
 
-        if (is_string($trackingItems)) {
-            $maybe = maybe_unserialize($trackingItems);
-            if ($maybe !== false) $trackingItems = $maybe;
-        }
-
-        if (is_array($trackingItems)) {
-            foreach ($trackingItems as $t) {
-                if (!is_array($t)) continue;
-                $n = trim((string) ($t['tracking_number'] ?? ''));
-                if ($n !== '') $trackingNumbers[] = $n;
-            }
-        }
-
-        // Fallback (some sites use this)
-        if (empty($trackingNumbers)) {
-            $fallback = trim((string) $order->get_meta('_tracking_number', true));
-            if ($fallback !== '') $trackingNumbers[] = $fallback;
-        }
-
-        $trackingNumbers = array_values(array_unique(array_filter($trackingNumbers)));
-
-        if (empty($trackingNumbers)) {
-            if (\SCW\Logger::enabled()) {
-                \SCW\Logger::log('Tracking meta debug', [
-                    '_tracking_number' => $order->get_meta('_tracking_number', true),
-                    '_wc_shipment_tracking_items' => $order->get_meta('_wc_shipment_tracking_items', true),
-                    '_ast_tracking_items' => $order->get_meta('_ast_tracking_items', true),
-                ]);
-            }
-
-            $order->add_order_note('ShipCompliant tracking push skipped: tracking number not found on order meta (_wc_shipment_tracking_items / _tracking_number).');
+        if ($trackingNumber === '' || $carrier === '') {
+            $order->add_order_note('ShipCompliant tracking push skipped: tracking number/carrier not found on order meta.');
             return;
         }
 
-        // ShipmentKey: use "1" to match your SalesOrder payload.
-        $shipmentKey = '1';
-
-        // Build endpoint template (from settings, but auto-fix common misconfig)
-        $endpointTemplate = trim((string) ($s['endpoint_tracking'] ?? ''));
-
-        // If settings are missing OR set to the wrong base path, force correct template
-        if ($endpointTemplate === '' || preg_match('#^/api/v1/salesOrders/tracking/?$#', $endpointTemplate)) {
-            $endpointTemplate = '/api/v1/salesOrders/{salesOrderKey}/tracking';
-        }
-
-        // If the template doesn't contain the placeholder, insert it
-        if (strpos($endpointTemplate, '{salesOrderKey}') === false) {
-            // If they gave "/api/v1/salesOrders" or "/api/v1/salesOrders/" then append
-            if (preg_match('#^/api/v1/salesOrders/?$#', $endpointTemplate)) {
-                $endpointTemplate = rtrim($endpointTemplate, '/') . '/{salesOrderKey}/tracking';
-            } else {
-                // Last-resort: append "/{salesOrderKey}/tracking" to whatever they configured
-                $endpointTemplate = rtrim($endpointTemplate, '/') . '/{salesOrderKey}/tracking';
-            }
-        }
-
-        // Replace placeholder
-        $endpoint = str_replace('{salesOrderKey}', rawurlencode($salesOrderKey), $endpointTemplate);
-
-        // Swagger sample payload
+        // Send BOTH identifiers. SC may accept orderId OR SalesOrderKey depending on your account/swagger.
         $payload = [
-            'ShipmentKey'     => $shipmentKey,
-            'TrackingNumbers' => array_values(array_filter($trackingNumbers)),
+            'orderId'        => ($scOrderId !== '' ? $scOrderId : null),
+            'salesOrderKey'  => ($salesOrderKey !== '' ? $salesOrderKey : null),
+            'shipmentKey'    => '1',
+            'carrier'        => $carrier,
+            'trackingNumber' => $trackingNumber,
+            'shipDate'       => gmdate('Y-m-d'),
         ];
 
-        // Log endpoint + payload (no PII)
-        if (\SCW\Logger::enabled()) {
-            \SCW\Logger::log('ShipCompliant tracking push request', [
-                'method'   => 'POST',
-                'endpoint' => $endpoint,
-                'payload'  => $payload,
-                'order_id' => (int) $order->get_id(),
-            ]);
+        // Remove null/empty keys
+        foreach ($payload as $k => $v) {
+            if ($v === null || $v === '') unset($payload[$k]);
         }
 
-        $res = $client->request('POST', $endpoint, $payload);
+        $res = $client->request('POST', $s['endpoint_tracking'], $payload);
 
         if (!$res['ok']) {
             $order->add_order_note('ShipCompliant tracking push FAILED: ' . ($res['error'] ?? 'Unknown'));
             return;
         }
 
-        $order->add_order_note('ShipCompliant tracking push OK: ' . implode(', ', $trackingNumbers));
+        $order->add_order_note('ShipCompliant tracking push OK: ' . $carrier . ' ' . $trackingNumber);
         $order->update_meta_data('_scw_tracking_pushed', 'yes');
         $order->save();
     }
 
+    private static function checkout_signature(array $ship_validate): string {
+    $cartSig = [];
 
+        if (WC()->cart) {
+            foreach (WC()->cart->get_cart() as $cart_item) {
+                $product = $cart_item['data'] ?? null;
+                if (!$product) continue;
+
+                $cartSig[] = [
+                    'sku' => (string) $product->get_sku(),
+                    'qty' => (int) ($cart_item['quantity'] ?? 1),
+                ];
+            }
+        }
+
+        return md5(wp_json_encode([
+            'ship' => $ship_validate,
+            'cart' => $cartSig,
+        ]));
+    }
+
+    /**
+     * POST /api/v1/salesOrders/check-compliance
+     * Requires a full SalesOrder payload (NOT only SalesOrderKey).
+     */
+    private static function check_compliance(Client $client, array $settings, array $salesOrder, array $addressOption): array {
+        $endpoint = $settings['endpoint_check_compliance'] ?? '/api/v1/salesOrders/check-compliance';
+
+        $payload = [
+            'SalesOrder'    => $salesOrder,
+            'AddressOption' => $addressOption,
+            'PersistOption' => 'Null',
+        ];
+
+        return $client->request('POST', $endpoint, $payload);
+    }
 
 }

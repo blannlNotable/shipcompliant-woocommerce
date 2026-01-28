@@ -30,7 +30,8 @@ class Utils {
 
             'endpoint_quote'            => '/api/v1/salesOrders/quote',
             'endpoint_commit'           => '/api/v1/salesOrders/commit',
-            'endpoint_tracking'         => '/api/v1/salesOrders/tracking',
+            'endpoint_tracking' => '/api/v1/salesOrders/{salesOrderKey}/tracking',
+            'endpoint_check_compliance' => '/api/v1/salesOrders/check-compliance',
         ];
 
         $saved = get_option('scw_settings', []);
